@@ -28,7 +28,7 @@ def check_password():
         return False
     return True
 
-# --- 2. GERADOR DE PDF ---
+# --- 2. GERADOR DE PDF (CORRIGIDO PARA STREAMLIT) ---
 def exportar_pdf(texto, placa):
     pdf = FPDF()
     pdf.add_page()
@@ -38,9 +38,13 @@ def exportar_pdf(texto, placa):
     pdf.ln(10)
     pdf.set_font("helvetica", "", 12)
     pdf.set_text_color(0, 0, 0)
+    
+    # Limpeza de caracteres para evitar erros de encode
     texto_limpo = texto.encode('latin-1', 'replace').decode('latin-1')
     pdf.multi_cell(0, 8, texto_limpo)
-    return pdf.output()
+    
+    # O SEGREDO: Converter o output para bytes explicitamente
+    return bytes(pdf.output())
 
 # --- 3. MOTOR DE PROCESSAMENTO HÍBRIDO ---
 @st.cache_data
@@ -77,10 +81,8 @@ def processar_dados_sesp(arquivos):
                     sentido = "N/I"
                     if "Sentido:" in lines[i]: sentido = lines[i].split("Sentido:")[-1].strip()
                     dt_obj = datetime.strptime(dt_str, '%d/%m/%Y %H:%M:%S')
-                    # Tenta limpar o nome da cidade de forma mais inteligente
                     cidade = local.split(' KM ')[0] if ' KM ' in local else local
                     if ' Sentido:' in cidade: cidade = cidade.split(' Sentido:')[0]
-                    
                     all_records.append({
                         'Placa': placa, 'Data_Hora': dt_obj, 'Hora': dt_obj.hour,
                         'Dia_Semana': dt_obj.strftime('%A'), 'Local': local,
@@ -98,7 +100,7 @@ if check_password():
         .stAlert { background-color: #161b22; color: white; border: 1px solid #ff4b4b; }
         </style>""", unsafe_allow_html=True)
 
-    st.title("🦅 WISE TALON - ANÁLISE DE DESLOCAMENTO")
+    st.title("🦅 WISE TALON - INTELIGÊNCIA OPERACIONAL")
 
     with st.sidebar:
         st.header("📂 CARGA DE DADOS")
@@ -110,7 +112,6 @@ if check_password():
     if arquivos:
         df_total = processar_dados_sesp(arquivos)
         if not df_total.empty:
-            # MÉTRICAS TOTAIS
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("PASSAGENS", len(df_total))
             m2.metric("VEÍCULOS ÚNICOS", df_total['Placa'].nunique())
@@ -119,27 +120,24 @@ if check_password():
 
             st.divider()
 
-            # --- NOVO: IDENTIFICAÇÃO DE ALVOS EM MÚLTIPLAS CIDADES ---
-            st.subheader("🚩 ALVOS DE INTERESSE (DESLOCAMENTO)")
-            # Agrupa por placa e conta quantas cidades únicas cada uma possui
+            # --- IDENTIFICAÇÃO DE DESLOCAMENTO ---
+            st.subheader("🚩 ALVOS DE INTERESSE (MULTICIDADES)")
             plates_by_city = df_total.groupby('Placa')['Cidade'].nunique()
             multi_city_targets = plates_by_city[plates_by_city > 1].index.tolist()
 
             if multi_city_targets:
-                st.warning(f"🔍 **DETECTADO:** {len(multi_city_targets)} veículos aparecem em mais de uma cidade.")
-                cols = st.columns(5) # Divide a lista em colunas para não ficar gigante
+                st.warning(f"🔍 **DETECTADO:** {len(multi_city_targets)} veículos em mais de uma cidade.")
+                cols = st.columns(5)
                 for idx, p in enumerate(multi_city_targets):
-                    # Mostra a placa e em quantas cidades ela apareceu
-                    cidades_alvo = df_total[df_total['Placa'] == p]['Cidade'].unique()
-                    cols[idx % 5].code(f"{p} ({len(cidades_alvo)} Cidades)")
+                    cols[idx % 5].code(f"{p}")
             else:
-                st.info("Nenhum veículo detectado em múltiplas cidades nesta base de dados.")
+                st.info("Nenhum veículo detectado em múltiplas cidades.")
 
             st.divider()
 
             # --- BUSCA POR ALVO ---
             st.subheader("🔎 INVESTIGAÇÃO DETALHADA")
-            placa_alvo = st.text_input("DIGITE A PLACA ACIMA PARA ANALISAR", "").upper().strip()
+            placa_alvo = st.text_input("DIGITE A PLACA PARA ANALISAR", "").upper().strip()
 
             if placa_alvo:
                 df_alvo = df_total[df_total['Placa'].str.contains(placa_alvo)]
@@ -150,14 +148,22 @@ if check_password():
                         txt = f"RELATORIO DE BUSCA - ALVO: {placa_alvo}\n"
                         txt += f"Cidades detectadas: {', '.join(df_alvo['Cidade'].unique())}\n"
                         txt += f"Total de registros: {len(df_alvo)}\n\nCRONOLOGIA:\n"
-                        for _, r in df_alvo.head(15).iterrows():
+                        for _, r in df_alvo.head(20).iterrows():
                             txt += f"- {r['Data_Hora'].strftime('%d/%m %H:%M')} | {r['Cidade']} | {r['Local']}\n"
                         
                         st.text_area("REGISTROS", txt, height=350)
-                        st.download_button("📥 BAIXAR PDF", data=exportar_pdf(txt, placa_alvo), file_name=f"Relatorio_{placa_alvo}.pdf")
+                        
+                        # O BOTÃO AGORA RECEBE BYTES DIRETAMENTE
+                        pdf_output = exportar_pdf(txt, placa_alvo)
+                        st.download_button(
+                            label="📥 BAIXAR PDF TÁTICO",
+                            data=pdf_output,
+                            file_name=f"Relatorio_{placa_alvo}.pdf",
+                            mime="application/pdf"
+                        )
 
                     with col2:
-                        st.markdown("### 🧭 Análise de Movimentação")
+                        st.markdown("### 🧭 Análise Geográfica")
                         df_gps = df_alvo.dropna(subset=['Lat', 'Lon'])
                         if not df_gps.empty:
                             m = folium.Map(tiles="cartodbpositron")
@@ -168,14 +174,9 @@ if check_password():
                             m.fit_bounds(coords)
                             st_folium(m, width="100%", height=500)
                         else:
-                            # Se não tem GPS, mostra gráfico de cidades
-                            fig_city = px.pie(df_alvo, names='Cidade', title=f"Distribuição Geográfica de {placa_alvo}", color_discrete_sequence=px.colors.sequential.Reds_r)
+                            fig_city = px.pie(df_alvo, names='Cidade', title=f"Presença por Cidade: {placa_alvo}", color_discrete_sequence=px.colors.sequential.Reds_r)
                             fig_city.update_layout(paper_bgcolor='rgba(0,0,0,0)', font_color="white")
                             st.plotly_chart(fig_city, use_container_width=True)
-                            
-                            st.write("**Histórico de Passagens:**")
                             st.dataframe(df_alvo[['Data_Hora', 'Cidade', 'Local', 'Sentido']], use_container_width=True)
                 else:
-                    st.error("Placa não encontrada nos arquivos carregados.")
-            else:
-                st.info("Insira uma placa para gerar os detalhes da rota.")
+                    st.error("Placa não encontrada.")
