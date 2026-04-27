@@ -8,19 +8,18 @@ import plotly.express as px
 import io
 import time
 
-# --- PROTEÇÃO DE BIBLIOTECAS ---
+# --- PROTEÇÃO E CARREGAMENTO DE BIBLIOTECAS ---
 try:
     from geopy.geocoders import Nominatim
-    from geopy.extra.rate_limiter import RateLimiter
-    GEOPY_AVAILABLE = True
+    GEOPY_INSTALLED = True
 except ImportError:
-    GEOPY_AVAILABLE = False
+    GEOPY_INSTALLED = False
 
 try:
     from fpdf import FPDF
-    FPDF_AVAILABLE = True
+    FPDF_INSTALLED = True
 except ImportError:
-    FPDF_AVAILABLE = False
+    FPDF_INSTALLED = False
 
 # --- 1. PROTOCOLO DE SEGURANÇA ---
 def check_password():
@@ -42,33 +41,40 @@ def check_password():
         return False
     return True
 
-# --- 2. MOTOR DE GEOLOCALIZAÇÃO (AJUSTADO) ---
+# --- 2. MOTOR DE GEOLOCALIZAÇÃO (LIMPEZA ULTRA) ---
 @st.cache_data
-def get_city_coords(local_bruto):
-    if not GEOPY_AVAILABLE or not local_bruto:
+def get_city_coords(texto_bruto):
+    if not GEOPY_INSTALLED or not texto_bruto:
         return None, None
     
-    # LIMPEZA AVANÇADA: Remove "BR XXX", "KM XXX+XXX" e "Sentido"
-    # Ex: "BR 070 KM 288+600 PRIMAVERA DO LESTE" -> "PRIMAVERA DO LESTE"
-    cidade_alvo = re.sub(r'BR\s?\d+', '', local_bruto, flags=re.IGNORECASE)
-    cidade_alvo = re.sub(r'KM\s?\d+[\+\d+]*', '', cidade_alvo, flags=re.IGNORECASE)
-    cidade_alvo = re.sub(r'Sentido:.*', '', cidade_alvo, flags=re.IGNORECASE)
-    cidade_alvo = re.sub(r'\(.*?\)', '', cidade_alvo)
-    cidade_alvo = cidade_alvo.replace('-', ' ').strip()
+    # LÓGICA DE LIMPEZA: Isolar apenas o nome da cidade
+    # 1. Remove "BR" e números da rodovia
+    temp = re.sub(r'BR\s*\d+', '', texto_bruto, flags=re.I)
+    # 2. Remove "KM" e as quilometragens (ex: 636+600)
+    temp = re.sub(r'KM\s*[\d+.,/]+', '', temp, flags=re.I)
+    # 3. Remove tudo o que vier após "Sentido:"
+    temp = re.sub(r'Sentido:.*', '', temp, flags=re.I)
+    # 4. Remove caracteres especiais remanescentes e IDs
+    temp = re.sub(r'ID:.*', '', temp, flags=re.I)
+    temp = re.sub(r'[^a-zA-ZÀ-ÿ\s]', '', temp)
     
-    # Se sobrar algo como "CUIABA EXTERNO", limpamos o "EXTERNO"
-    cidade_alvo = cidade_alvo.split(' ')[0] if ' ' in cidade_alvo else cidade_alvo
-
-    if len(cidade_alvo) < 3: return None, None
+    cidade = temp.strip()
+    
+    # Se a limpeza resultar em algo vazio ou muito curto, aborta
+    if len(cidade) < 3:
+        return None, None
 
     try:
-        # Novo USER_AGENT único para evitar bloqueio
-        geolocator = Nominatim(user_agent="WiseTalon_MT_PublicSafety_Analysis_v42")
-        query = f"{cidade_alvo}, Mato Grosso, Brasil"
+        # User_agent único com timestamp para evitar bloqueio por ConfigurationError
+        ua = f"WiseTalon_MT_Analytics_{int(time.time())}"
+        geolocator = Nominatim(user_agent=ua)
+        
+        # Busca focada em Mato Grosso
+        query = f"{cidade}, Mato Grosso, Brasil"
         location = geolocator.geocode(query, timeout=10)
         
-        # Pequena pausa para não sobrecarregar o serviço gratuito
-        time.sleep(0.5) 
+        # Pausa obrigatória de 1 segundo para respeitar o limite do servidor gratuito
+        time.sleep(1) 
         
         if location:
             return location.latitude, location.longitude
@@ -76,14 +82,14 @@ def get_city_coords(local_bruto):
     except:
         return None, None
 
-# --- 3. PROCESSAMENTO DE ARQUIVOS ---
+# --- 3. PROCESSAMENTO DE DADOS ---
 @st.cache_data
 def processar_arquivos(arquivos):
     all_records = []
     for arq in arquivos:
         content = arq.read().decode('utf-8', errors='ignore')
         
-        # MODELO 1: COM GPS (Blocos)
+        # MODELO 1: COM GPS NO CSV (Formato Bloco)
         if '"Placa ' in content:
             blocks = re.split(r'"Placa\s+', content)
             for block in blocks[1:]:
@@ -98,32 +104,32 @@ def processar_arquivos(arquivos):
                 data['Local'] = l_m.group(1).strip() if l_m else "N/I"
                 data['Cidade'] = data['Local'].split('-')[0].strip() if '-' in data['Local'] else data['Local']
                 data['Hora'] = data['Data_Hora'].hour
-                data['Is_City_Center'] = False
+                data['Estimado'] = False
                 all_records.append(data)
         
-        # MODELO 2: LISTA SESP (Sem GPS nativo)
+        # MODELO 2: LISTA SESP (Pesquisa por nome da cidade)
         else:
             lines = [l.strip().replace('"', '') for l in content.split('\n') if l.strip()]
             for i in range(len(lines)):
                 match = re.search(r'(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})\s+([A-Z0-9-]{7,8})', lines[i])
                 if match:
                     dt_s, placa = match.group(1), match.group(2)
-                    local_original = lines[i-1] if i > 0 else "N/I"
+                    local_bruto = lines[i-1] if i > 0 else "N/I"
                     dt_o = datetime.strptime(dt_s, '%d/%m/%Y %H:%M:%S')
                     
-                    # Chama o motor de busca pelo nome da cidade
-                    lat_c, lon_c = get_city_coords(local_original)
+                    # Tenta buscar a latitude/longitude pelo nome da cidade limpo
+                    lat_e, lon_e = get_city_coords(local_bruto)
                     
                     all_records.append({
                         'Placa': placa, 'Data_Hora': dt_o, 'Hora': dt_o.hour,
-                        'Local': local_original, 'Cidade': local_original,
-                        'Lat': lat_c, 'Lon': lon_c, 'Is_City_Center': True
+                        'Local': local_bruto, 'Cidade': local_bruto,
+                        'Lat': lat_e, 'Lon': lon_e, 'Estimado': True
                     })
     return pd.DataFrame(all_records).sort_values(by='Data_Hora', ascending=False).reset_index(drop=True)
 
-# --- 4. UI ---
+# --- 4. INTERFACE ---
 if check_password():
-    st.set_page_config(page_title="Wise Talon v4.2", layout="wide")
+    st.set_page_config(page_title="Wise Talon v4.3", layout="wide")
     st.markdown("""<style>
         .stApp { background-color: #0b0d11; color: #e0e0e0; }
         div[data-testid="stMetric"] { background-color: #161b22; border-left: 5px solid #ff4b4b; padding: 15px; border-radius: 8px; }
@@ -133,7 +139,7 @@ if check_password():
     with st.sidebar:
         st.title("🦅 WISE TALON")
         arquivos = st.file_uploader("Upload CSV SESP", type=["csv"], accept_multiple_files=True)
-        if st.button("Reiniciar Sistema"): st.session_state.clear(); st.rerun()
+        if st.button("🔄 Reiniciar Sistema"): st.session_state.clear(); st.rerun()
 
     if arquivos:
         df_total = processar_arquivos(arquivos)
@@ -143,37 +149,34 @@ if check_password():
             c1, c2, c3 = st.columns(3)
             c1.metric("REGISTROS", len(df_total))
             c2.metric("PLACAS ÚNICAS", df_total['Placa'].nunique())
-            c3.metric("PONTOS MAPEADOS", df_total['Lat'].notna().sum())
+            c3.metric("MAPEADOS", df_total['Lat'].notna().sum())
             
-            st.divider()
             col_a, col_b = st.columns(2)
             with col_a:
-                fig_city = px.pie(df_total, names='Local', title="Distribuição de Passagens", hole=0.4, color_discrete_sequence=px.colors.sequential.Reds_r)
-                st.plotly_chart(fig_city, use_container_width=True)
+                st.plotly_chart(px.pie(df_total, names='Local', hole=0.4, title="Locais de Passagem", color_discrete_sequence=px.colors.sequential.Reds_r), use_container_width=True)
             with col_b:
-                fig_hour = px.histogram(df_total, x='Hora', title="Fluxo por Horário", color_discrete_sequence=['#ff4b4b'])
-                st.plotly_chart(fig_hour, use_container_width=True)
+                st.plotly_chart(px.histogram(df_total, x='Hora', title="Fluxo por Hora", color_discrete_sequence=['#ff4b4b']), use_container_width=True)
 
         with tab2:
-            busca = st.text_input("INSIRA A PLACA PARA VER O TRAJETO", "").upper().strip()
+            busca = st.text_input("INSIRA A PLACA PARA VER O TRAJETÓRIA", "").upper().strip()
             if busca:
                 df_alvo = df_total[df_total['Placa'].str.contains(busca)]
                 if not df_alvo.empty:
-                    c_info, c_map = st.columns([1, 1.5])
-                    with c_info:
+                    c_inf, c_map = st.columns([1, 1.5])
+                    with c_inf:
                         st.markdown(f"### 📋 Itinerário de {busca}")
                         st.dataframe(df_alvo[['Data_Hora', 'Local']], height=400)
                     with c_map:
-                        st.markdown("### 🗺️ Trajetória (Estimada por Cidade)")
-                        df_mapa = df_alvo.dropna(subset=['Lat', 'Lon']).sort_values('Data_Hora')
-                        if not df_mapa.empty:
+                        st.markdown("### 🗺️ Mapa Operacional")
+                        df_m = df_alvo.dropna(subset=['Lat', 'Lon']).sort_values('Data_Hora')
+                        if not df_m.empty:
                             m = folium.Map(tiles="cartodbpositron")
-                            coords = [[r['Lat'], r['Lon']] for _, r in df_mapa.iterrows()]
-                            folium.PolyLine(coords, color="#ff4b4b", weight=5).add_to(m)
-                            for _, r in df_mapa.iterrows():
-                                cor = 'orange' if r['Is_City_Center'] else 'blue'
+                            pts = [[r['Lat'], r['Lon']] for _, r in df_m.iterrows()]
+                            folium.PolyLine(pts, color="#ff4b4b", weight=5).add_to(m)
+                            for _, r in df_m.iterrows():
+                                cor = 'orange' if r['Estimado'] else 'blue'
                                 folium.Marker([r['Lat'], r['Lon']], popup=r['Local'], icon=folium.Icon(color=cor)).add_to(m)
-                            m.fit_bounds(coords)
+                            m.fit_bounds(pts)
                             st_folium(m, width="100%", height=550)
                         else:
-                            st.error("⚠️ Não foi possível localizar as cidades no mapa para esta placa.")
+                            st.warning("Não há coordenadas ou cidades identificáveis para esta placa.")
