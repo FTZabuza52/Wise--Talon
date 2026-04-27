@@ -7,6 +7,8 @@ from datetime import datetime
 import plotly.express as px
 from fpdf import FPDF
 import io
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 
 # --- 1. PROTOCOLO DE SEGURANÇA ---
 def check_password():
@@ -28,8 +30,24 @@ def check_password():
         return False
     return True
 
-# --- 2. GERADOR DE PDF (CORRIGIDO PARA STREAMLIT) ---
-def exportar_pdf(texto, placa):
+# --- 2. MOTOR DE GEOLOCALIZAÇÃO (Busca de Cidades) ---
+@st.cache_data
+def get_city_coords(cidade):
+    """Transforma o nome da cidade em coordenadas reais"""
+    if not cidade or cidade == "N/I":
+        return None, None
+    try:
+        geolocator = Nominatim(user_agent="wise_talon_safety")
+        # Refinamos a busca para MT para ser mais preciso
+        location = geolocator.geocode(f"{cidade}, Mato Grosso, Brazil")
+        if location:
+            return location.latitude, location.longitude
+        return None, None
+    except:
+        return None, None
+
+# --- 3. GERADOR DE PDF ---
+def exportar_pdf(texto, placa, mapa_img=None):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("helvetica", "B", 16)
@@ -37,16 +55,18 @@ def exportar_pdf(texto, placa):
     pdf.cell(0, 10, "RELATORIO DE INTELIGENCIA - FT20", ln=True, align='C')
     pdf.ln(10)
     pdf.set_font("helvetica", "", 12)
-    pdf.set_text_color(0, 0, 0)
-    
-    # Limpeza de caracteres para evitar erros de encode
     texto_limpo = texto.encode('latin-1', 'replace').decode('latin-1')
     pdf.multi_cell(0, 8, texto_limpo)
     
-    # O SEGREDO: Converter o output para bytes explicitamente
+    if mapa_img:
+        pdf.ln(10)
+        pdf.set_font("helvetica", "B", 12)
+        pdf.cell(0, 10, "ANEXO: MAPA DE TRAJETORIA", ln=True)
+        img_buffer = io.BytesIO(mapa_img)
+        pdf.image(img_buffer, x=10, w=190)
     return bytes(pdf.output())
 
-# --- 3. MOTOR DE PROCESSAMENTO HÍBRIDO ---
+# --- 4. MOTOR DE PROCESSAMENTO ---
 @st.cache_data
 def processar_dados_sesp(arquivos):
     all_records = []
@@ -78,105 +98,84 @@ def processar_dados_sesp(arquivos):
                 if match:
                     dt_str, placa = match.group(1), match.group(2)
                     local = lines[i-1] if i > 0 else "N/I"
-                    sentido = "N/I"
-                    if "Sentido:" in lines[i]: sentido = lines[i].split("Sentido:")[-1].strip()
                     dt_obj = datetime.strptime(dt_str, '%d/%m/%Y %H:%M:%S')
                     cidade = local.split(' KM ')[0] if ' KM ' in local else local
                     if ' Sentido:' in cidade: cidade = cidade.split(' Sentido:')[0]
+                    
+                    # Tenta pegar coordenada da cidade se não houver GPS
+                    lat_city, lon_city = get_city_coords(cidade.strip())
+                    
                     all_records.append({
                         'Placa': placa, 'Data_Hora': dt_obj, 'Hora': dt_obj.hour,
                         'Dia_Semana': dt_obj.strftime('%A'), 'Local': local,
-                        'Cidade': cidade.strip(), 'Sentido': sentido, 'Lat': None, 'Lon': None
+                        'Cidade': cidade.strip(), 'Sentido': "N/I", 
+                        'Lat': lat_city, 'Lon': lon_city, 'Is_City_Center': True
                     })
     return pd.DataFrame(all_records).sort_values(by='Data_Hora', ascending=False).reset_index(drop=True)
 
-# --- 4. INTERFACE ---
+# --- 5. UI ---
 if check_password():
     st.set_page_config(page_title="Wise Talon - FT20", layout="wide")
-    st.markdown("""<style>
-        .stApp { background-color: #0b0d11; color: #e0e0e0; }
-        div[data-testid="stMetric"] { background-color: #161b22; border-left: 5px solid #ff4b4b; padding: 15px; border-radius: 8px; }
-        h1, h2, h3 { color: #ff4b4b !important; font-family: 'Courier New', Courier, monospace; }
-        .stAlert { background-color: #161b22; color: white; border: 1px solid #ff4b4b; }
-        </style>""", unsafe_allow_html=True)
-
-    st.title("🦅 WISE TALON - INTELIGÊNCIA OPERACIONAL")
+    st.markdown("<style>.stApp { background-color: #0b0d11; color: #e0e0e0; } h1, h2, h3 { color: #ff4b4b !important; }</style>", unsafe_allow_html=True)
+    st.title("🦅 WISE TALON - GEO-INTELIGÊNCIA")
 
     with st.sidebar:
-        st.header("📂 CARGA DE DADOS")
         arquivos = st.file_uploader("Suba os arquivos CSV", type=["csv"], accept_multiple_files=True)
-        if st.button("🔄 Reiniciar Sistema"):
-            st.session_state.clear()
-            st.rerun()
+        if st.button("🔄 Reiniciar"): st.session_state.clear(); st.rerun()
 
     if arquivos:
         df_total = processar_dados_sesp(arquivos)
         if not df_total.empty:
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("PASSAGENS", len(df_total))
-            m2.metric("VEÍCULOS ÚNICOS", df_total['Placa'].nunique())
-            m3.metric("CIDADES", df_total['Cidade'].nunique())
-            m4.metric("GPS DISPONÍVEL", df_total['Lat'].notna().sum())
-
-            st.divider()
-
-            # --- IDENTIFICAÇÃO DE DESLOCAMENTO ---
-            st.subheader("🚩 ALVOS DE INTERESSE (MULTICIDADES)")
+            # --- DETECÇÃO DE DESLOCAMENTO ---
+            st.subheader("🚩 ALVOS EM MÚLTIPLAS CIDADES")
             plates_by_city = df_total.groupby('Placa')['Cidade'].nunique()
             multi_city_targets = plates_by_city[plates_by_city > 1].index.tolist()
-
             if multi_city_targets:
-                st.warning(f"🔍 **DETECTADO:** {len(multi_city_targets)} veículos em mais de uma cidade.")
                 cols = st.columns(5)
-                for idx, p in enumerate(multi_city_targets):
-                    cols[idx % 5].code(f"{p}")
-            else:
-                st.info("Nenhum veículo detectado em múltiplas cidades.")
+                for idx, p in enumerate(multi_city_targets): cols[idx % 5].code(f"{p}")
 
             st.divider()
-
-            # --- BUSCA POR ALVO ---
-            st.subheader("🔎 INVESTIGAÇÃO DETALHADA")
-            placa_alvo = st.text_input("DIGITE A PLACA PARA ANALISAR", "").upper().strip()
+            placa_alvo = st.text_input("DIGITE A PLACA PARA ANÁLISE", "").upper().strip()
 
             if placa_alvo:
                 df_alvo = df_total[df_total['Placa'].str.contains(placa_alvo)]
                 if not df_alvo.empty:
                     col1, col2 = st.columns([1, 1.2])
+                    
                     with col1:
-                        st.markdown("### 📄 Relatório de Itinerário")
-                        txt = f"RELATORIO DE BUSCA - ALVO: {placa_alvo}\n"
-                        txt += f"Cidades detectadas: {', '.join(df_alvo['Cidade'].unique())}\n"
-                        txt += f"Total de registros: {len(df_alvo)}\n\nCRONOLOGIA:\n"
-                        for _, r in df_alvo.head(20).iterrows():
-                            txt += f"- {r['Data_Hora'].strftime('%d/%m %H:%M')} | {r['Cidade']} | {r['Local']}\n"
-                        
+                        st.markdown("### 📄 Itinerário")
+                        txt = f"RELATORIO ALVO: {placa_alvo}\nCidades: {', '.join(df_alvo['Cidade'].unique())}\n\nCRONOLOGIA:\n"
+                        for _, r in df_alvo.head(15).iterrows():
+                            txt += f"- {r['Data_Hora'].strftime('%d/%m %H:%M')} | {r['Cidade']}\n"
                         st.text_area("REGISTROS", txt, height=350)
                         
-                        # O BOTÃO AGORA RECEBE BYTES DIRETAMENTE
-                        pdf_output = exportar_pdf(txt, placa_alvo)
-                        st.download_button(
-                            label="📥 BAIXAR PDF TÁTICO",
-                            data=pdf_output,
-                            file_name=f"Relatorio_{placa_alvo}.pdf",
-                            mime="application/pdf"
-                        )
-
-                    with col2:
-                        st.markdown("### 🧭 Análise Geográfica")
+                        # Preparar imagem do mapa para o PDF
+                        mapa_png = None
                         df_gps = df_alvo.dropna(subset=['Lat', 'Lon'])
                         if not df_gps.empty:
+                            try:
+                                fig = px.scatter_mapbox(df_gps, lat="Lat", lon="Lon", zoom=8)
+                                fig.update_layout(mapbox_style="open-street-map", margin={"r":0,"t":0,"l":0,"b":0})
+                                mapa_png = fig.to_image(format="png")
+                            except: mapa_png = None
+                        
+                        st.download_button("📥 BAIXAR PDF COM MAPA", data=exportar_pdf(txt, placa_alvo, mapa_png), file_name=f"Relatorio_{placa_alvo}.pdf")
+
+                    with col2:
+                        st.markdown("### 🧭 Mapa de Movimentação")
+                        df_mapa = df_alvo.dropna(subset=['Lat', 'Lon']).sort_values('Data_Hora')
+                        if not df_mapa.empty:
                             m = folium.Map(tiles="cartodbpositron")
-                            coords = [[r['Lat'], r['Lon']] for _, r in df_gps.iterrows()]
+                            coords = [[r['Lat'], r['Lon']] for _, r in df_mapa.iterrows()]
                             folium.PolyLine(coords, color="#ff4b4b", weight=5).add_to(m)
-                            folium.Marker(coords[0], tooltip="Início", icon=folium.Icon(color='green')).add_to(m)
-                            folium.Marker(coords[-1], tooltip="Último", icon=folium.Icon(color='red')).add_to(m)
+                            
+                            # Marcadores diferenciados
+                            for idx, row in df_mapa.iterrows():
+                                color = 'blue'
+                                if row.get('Is_City_Center'): color = 'orange' # Laranja para centro da cidade
+                                folium.CircleMarker([row['Lat'], row['Lon']], radius=6, color=color, fill=True, popup=row['Local']).add_to(m)
+                            
                             m.fit_bounds(coords)
-                            st_folium(m, width="100%", height=500)
+                            st_folium(m, width="100%", height=550)
                         else:
-                            fig_city = px.pie(df_alvo, names='Cidade', title=f"Presença por Cidade: {placa_alvo}", color_discrete_sequence=px.colors.sequential.Reds_r)
-                            fig_city.update_layout(paper_bgcolor='rgba(0,0,0,0)', font_color="white")
-                            st.plotly_chart(fig_city, use_container_width=True)
-                            st.dataframe(df_alvo[['Data_Hora', 'Cidade', 'Local', 'Sentido']], use_container_width=True)
-                else:
-                    st.error("Placa não encontrada.")
+                            st.error("Sem dados geográficos para este alvo.")
